@@ -80,16 +80,83 @@ fn is_codex_responses_endpoint(endpoint: &str) -> bool {
     matches!(path, "/responses" | "/responses/compact")
 }
 
-/// ChatGPT Codex backend requires an explicit `store: false` and a list-typed
-/// `input`. Native passthrough clients routed to the official card may omit
-/// both, so fill them in — never overriding client-supplied values.
-fn normalize_codex_official_responses_body(body: &mut Value) {
+/// Top-level fields accepted by the ChatGPT Codex backend for `/responses`.
+///
+/// The upstream contract is OpenAI's official codex-rs `ResponsesApiRequest`
+/// struct (codex-rs/codex-api/src/common.rs): the backend strictly validates the
+/// request body and rejects any top-level field outside that struct with
+/// `400 Unsupported parameter: ...`. The list below mirrors that struct at the
+/// pinned codex-rs version (rust-v0.153.4, see `CODEX_OAUTH_CLIENT_VERSION`) and
+/// matches current main; the optional fields (`stream_options`, `text`,
+/// `client_metadata`, `access_programs`) are part of the struct, so dropping
+/// them would silently strip legitimate client settings (e.g. `text.verbosity`).
+///
+/// Same contract, enforced on constructed bodies by the `is_codex_oauth`
+/// branch of `anthropic_to_responses` (providers/transform_responses.rs,
+/// "Codex OAuth 特殊协议约束" block) — keep the two in sync when bumping the
+/// pinned codex-rs version.
+const CODEX_OFFICIAL_RESPONSES_WHITELIST: &[&str] = &[
+    "model",
+    "instructions",
+    "input",
+    "tools",
+    "tool_choice",
+    "parallel_tool_calls",
+    "reasoning",
+    "include",
+    "prompt_cache_key",
+    "store",
+    "stream",
+    "service_tier",
+    "stream_options",
+    "text",
+    "client_metadata",
+    "access_programs",
+];
+
+/// Normalize a native-passthrough Responses request body for the official
+/// ChatGPT Codex backend.
+///
+/// - `compact == false` (`/responses`): enforce the codex-rs
+///   `ResponsesApiRequest` contract (codex-rs/codex-api/src/common.rs):
+///   whitelist-filter top-level fields, force `include` to carry
+///   `reasoning.encrypted_content`, fill the required fields
+///   (`instructions`/`tools`/`parallel_tool_calls`) with defaults, and force
+///   `stream: true` (the upstream is streaming-only).
+/// - `compact == true` (`/responses/compact`): the upstream contract is the
+///   distinct codex-rs `CompactionInput` struct (same file): a smaller field
+///   set with no `store`/`stream`/`tool_choice`/`include`, answered by a plain
+///   JSON (non-SSE) body. The body passes through unfiltered and `store`/
+///   `stream` are NOT injected — adding them would recreate the very
+///   `400 Unsupported parameter` this normalization exists to prevent. Only a
+///   string `input` is wrapped into a list.
+///
+/// Never overrides explicit client values except `stream` on `/responses`
+/// (codex-rs hardcodes `stream: true`; a client asking for `stream: false`
+/// gets the SSE stream aggregated back into JSON on the response side).
+fn normalize_codex_official_responses_body(body: &mut Value, compact: bool) {
     let Some(object) = body.as_object_mut() else {
         return;
     };
-    if !object.contains_key("store") {
-        object.insert("store".to_string(), Value::Bool(false));
+
+    if !compact {
+        // —— 顶层白名单过滤：codex-rs ResponsesApiRequest 之外的字段一律删除 ——
+        let dropped: Vec<String> = object
+            .keys()
+            .filter(|key| !CODEX_OFFICIAL_RESPONSES_WHITELIST.contains(&key.as_str()))
+            .cloned()
+            .collect();
+        if !dropped.is_empty() {
+            log::debug!(
+                "[Codex] Dropped unsupported top-level field(s) for official upstream: {dropped:?}"
+            );
+            for key in dropped {
+                object.remove(&key);
+            }
+        }
     }
+
+    // input 必须是列表；字符串 input 包装为单条 user message。（两个端点通用）
     if let Some(text) = object
         .get("input")
         .and_then(Value::as_str)
@@ -104,6 +171,49 @@ fn normalize_codex_official_responses_body(body: &mut Value) {
             }]),
         );
     }
+
+    if compact {
+        // CompactionInput 契约到此为止：不注入 store/stream，不做 include/必填字段
+        // 处理（见函数文档）。客户端自带字段原样透传。
+        return;
+    }
+
+    // ChatGPT 消费级后端不允许服务端持久化，store 必须显式为 false。
+    if !object.contains_key("store") {
+        object.insert("store".to_string(), Value::Bool(false));
+    }
+
+    // include 必含 reasoning.encrypted_content：无服务端状态 + 无加密回传
+    // = 多轮 reasoning 中间态断链（对齐 transform_responses.rs codex_oauth 分支）。
+    const REASONING_MARKER: &str = "reasoning.encrypted_content";
+    let mut includes: Vec<Value> = object
+        .get("include")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if !includes
+        .iter()
+        .any(|v| v.as_str() == Some(REASONING_MARKER))
+    {
+        includes.push(Value::String(REASONING_MARKER.to_string()));
+    }
+    object.insert("include".to_string(), Value::Array(includes));
+
+    // —— 兜底必填字段（entry/or_insert：客户端显式值优先，缺则注入默认值）——
+    object
+        .entry("instructions".to_string())
+        .or_insert_with(|| Value::String(String::new()));
+    object
+        .entry("tools".to_string())
+        .or_insert_with(|| Value::Array(Vec::new()));
+    object
+        .entry("parallel_tool_calls".to_string())
+        .or_insert_with(|| Value::Bool(true));
+
+    // —— 强制 stream = true ——
+    // codex-rs 硬编码 true；即便客户端传 stream:false 也覆盖，
+    // 响应侧会把上游 SSE 聚合回单个 JSON 再返回客户端。
+    object.insert("stream".to_string(), Value::Bool(true));
 }
 
 pub struct ForwardResult {
@@ -1505,6 +1615,12 @@ impl RequestForwarder {
         // suffix and add the context-1m beta header.
         let mut codex_anthropic_one_m = false;
 
+        // Codex official passthrough: the ChatGPT backend is streaming-only, so the
+        // normalize step below force-upgrades `stream` to true. A client that did not
+        // ask for streaming (is_streaming_request) therefore has to get the upstream
+        // SSE aggregated back into a single Responses JSON.
+        let mut codex_official_aggregate_sse = false;
+
         // 转换请求体（如果需要）
         let mut request_body = if codex_responses_to_chat {
             let mut mapped_body = mapped_body;
@@ -1610,7 +1726,20 @@ impl RequestForwarder {
             }
         } else {
             if codex_official_auth_passthrough && is_codex_responses_endpoint(endpoint) {
-                normalize_codex_official_responses_body(&mut mapped_body);
+                // Read the client's own streaming signal before normalize forces
+                // `stream: true`: use the repo-wide predicate (body stream flag, SSE
+                // Accept header, SSE endpoint markers) on the pre-normalization body.
+                // `request_is_streaming` cannot be reused for this decision — it is
+                // derived from the normalized body, where stream is already true.
+                // compact uses the separate `CompactionInput` contract (no store/
+                // stream injection; see `normalize_codex_official_responses_body`).
+                let compact = endpoint
+                    .split('?')
+                    .next()
+                    .unwrap_or(endpoint)
+                    .ends_with("/compact");
+                codex_official_aggregate_sse = !is_streaming_request(endpoint, body, headers);
+                normalize_codex_official_responses_body(&mut mapped_body, compact);
             }
             mapped_body
         };
@@ -2409,6 +2538,12 @@ impl RequestForwarder {
             let mut response = self
                 .prepare_success_response_for_failover(response, request_is_streaming)
                 .await?;
+            // Codex official passthrough with a non-streaming client: the forced
+            // `stream:true` upstream answered SSE; aggregate it back into the single
+            // Responses JSON the client asked for before handing the response over.
+            if codex_official_aggregate_sse && response.is_sse() {
+                response = self.aggregate_codex_official_sse_response(response).await?;
+            }
             // Streaming requests normally return SSE. If a compatible gateway
             // explicitly returns JSON instead, buffer and validate it inside the retry
             // loop as well so a 2xx Anthropic error envelope can still fail over. Do
@@ -2668,6 +2803,62 @@ impl RequestForwarder {
 
         let replay = futures::stream::once(async move { Ok(first) }).chain(stream);
         Ok(ProxyResponse::streamed(status, headers, replay))
+    }
+
+    /// Codex official passthrough for a client that did not ask for streaming: the
+    /// ChatGPT backend is streaming-only, so `stream` was force-upgraded to true and
+    /// a success response arrives as SSE. Aggregate the event stream back into the
+    /// single Responses JSON object the client expects. Terminal `response.failed`/
+    /// `error` events surface as errors inside the retry loop instead of being handed
+    /// to the client as a success. Official cards are NonRetryable
+    /// (categorize_proxy_error), so this failure is terminal: there is no failover.
+    async fn aggregate_codex_official_sse_response(
+        &self,
+        response: ProxyResponse,
+    ) -> Result<ProxyResponse, ProxyError> {
+        let status = response.status();
+        let mut headers = response.headers().clone();
+        let encoding = get_content_encoding(&headers);
+        let read = response.bytes_with_limit(MAX_RESPONSE_BODY_BYTES);
+        let raw = if self.non_streaming_timeout.is_zero() {
+            read.await?
+        } else {
+            tokio::time::timeout(self.non_streaming_timeout, read)
+                .await
+                .map_err(|_| {
+                    ProxyError::Timeout(format!(
+                        "响应体读取超时: {}s（上游发完响应头后 body 未到达）",
+                        self.non_streaming_timeout.as_secs()
+                    ))
+                })??
+        };
+        let decoded = match encoding {
+            Some(encoding) => {
+                match decompress_body_with_limit(&encoding, &raw, MAX_RESPONSE_BODY_BYTES) {
+                    Ok(Some(decompressed)) => decompressed,
+                    // 不支持的编码 / 解压失败 / 解压后超限：退回（已有上限的）原始字节
+                    _ => raw.to_vec(),
+                }
+            }
+            None => raw.to_vec(),
+        };
+        let body_str = String::from_utf8_lossy(&decoded);
+        let aggregated = super::sse::responses_sse_to_response_value(&body_str)?;
+        let body = serde_json::to_vec(&aggregated).map_err(|e| {
+            ProxyError::TransformError(format!(
+                "Failed to serialize aggregated Responses JSON: {e}"
+            ))
+        })?;
+
+        // The rebuilt body is a JSON document, not an SSE byte stream: fix the
+        // entity headers so downstream response processing treats it as
+        // non-streaming (`process_response` keys off the content-type).
+        super::response_processor::strip_entity_headers_for_rebuilt_body(&mut headers);
+        headers.insert(
+            http::header::CONTENT_TYPE,
+            http::HeaderValue::from_static("application/json"),
+        );
+        Ok(ProxyResponse::buffered(status, headers, Bytes::from(body)))
     }
 
     async fn resolve_claude_api_format(
@@ -4756,7 +4947,7 @@ mod tests {
             "model": "gpt-5.6-luna",
             "input": "hi",
         });
-        normalize_codex_official_responses_body(&mut body);
+        normalize_codex_official_responses_body(&mut body, false);
         assert_eq!(body["store"], serde_json::json!(false));
         assert_eq!(
             body["input"],
@@ -4772,7 +4963,7 @@ mod tests {
             "store": true,
             "input": [{ "type": "message", "role": "user", "content": [] }],
         });
-        normalize_codex_official_responses_body(&mut explicit);
+        normalize_codex_official_responses_body(&mut explicit, false);
         assert_eq!(explicit["store"], serde_json::json!(true));
         assert_eq!(
             explicit["input"],
@@ -4781,14 +4972,196 @@ mod tests {
 
         // Non-string input (array/object) passes through untouched.
         let mut list_input = serde_json::json!({ "input": [{ "type": "message" }] });
-        normalize_codex_official_responses_body(&mut list_input);
+        normalize_codex_official_responses_body(&mut list_input, false);
         assert_eq!(
             list_input["input"],
             serde_json::json!([{ "type": "message" }])
         );
         let mut object_input = serde_json::json!({ "input": { "text": "hi" } });
-        normalize_codex_official_responses_body(&mut object_input);
+        normalize_codex_official_responses_body(&mut object_input, false);
         assert_eq!(object_input["input"], serde_json::json!({ "text": "hi" }));
+    }
+
+    #[test]
+    fn normalize_codex_official_responses_body_drops_unsupported_top_level_fields() {
+        let mut body = serde_json::json!({
+            "model": "gpt-5.6-luna",
+            "input": [],
+            "max_output_tokens": 1024,
+            "temperature": 0.7,
+            "top_p": 0.9,
+            "previous_response_id": "resp_123",
+            "wild_custom_field": { "nested": true },
+            "reasoning": { "effort": "high" },
+            "tool_choice": "auto",
+            "prompt_cache_key": "session-key",
+            "service_tier": "priority",
+            "stream_options": { "reasoning_summary_delivery": "sequential_cutoff" },
+            "text": { "verbosity": "low" },
+            "client_metadata": { "session": "abc" },
+            "access_programs": { "cyber": "standard" },
+        });
+
+        normalize_codex_official_responses_body(&mut body, false);
+
+        let object = body.as_object().expect("body stays an object");
+        for dropped in [
+            "max_output_tokens",
+            "temperature",
+            "top_p",
+            "previous_response_id",
+            "wild_custom_field",
+        ] {
+            assert!(
+                !object.contains_key(dropped),
+                "{dropped} must be dropped for the official upstream"
+            );
+        }
+        // Client-supplied whitelisted fields survive; normalize-added fields are present.
+        for kept in [
+            "model",
+            "input",
+            "reasoning",
+            "tool_choice",
+            "prompt_cache_key",
+            "service_tier",
+            "stream_options",
+            "text",
+            "client_metadata",
+            "access_programs",
+            "store",
+            "stream",
+            "instructions",
+            "tools",
+            "parallel_tool_calls",
+            "include",
+        ] {
+            assert!(object.contains_key(kept), "{kept} must be kept/present");
+        }
+        assert_eq!(body["reasoning"], serde_json::json!({ "effort": "high" }));
+        assert_eq!(body["prompt_cache_key"], serde_json::json!("session-key"));
+    }
+
+    #[test]
+    fn normalize_codex_official_responses_body_ensures_encrypted_reasoning_include() {
+        const MARKER: &str = "reasoning.encrypted_content";
+
+        // Missing include is created with the marker.
+        let mut body = serde_json::json!({ "model": "m" });
+        normalize_codex_official_responses_body(&mut body, false);
+        assert_eq!(body["include"], serde_json::json!([MARKER]));
+
+        // Existing array gains the marker without losing entries.
+        let mut body = serde_json::json!({ "include": ["web_search_call.action.sources"] });
+        normalize_codex_official_responses_body(&mut body, false);
+        assert_eq!(
+            body["include"],
+            serde_json::json!(["web_search_call.action.sources", MARKER])
+        );
+
+        // Marker already present: no duplicate.
+        let mut body = serde_json::json!({ "include": [MARKER] });
+        normalize_codex_official_responses_body(&mut body, false);
+        let includes = body["include"].as_array().unwrap();
+        assert_eq!(
+            includes
+                .iter()
+                .filter(|v| v.as_str() == Some(MARKER))
+                .count(),
+            1
+        );
+
+        // Non-array include is rebuilt around the marker.
+        let mut body = serde_json::json!({ "include": MARKER });
+        normalize_codex_official_responses_body(&mut body, false);
+        assert_eq!(body["include"], serde_json::json!([MARKER]));
+    }
+
+    #[test]
+    fn normalize_codex_official_responses_body_fills_required_defaults_without_overriding() {
+        let mut body = serde_json::json!({ "model": "m" });
+        normalize_codex_official_responses_body(&mut body, false);
+        assert_eq!(body["instructions"], serde_json::json!(""));
+        assert_eq!(body["tools"], serde_json::json!([]));
+        assert_eq!(body["parallel_tool_calls"], serde_json::json!(true));
+
+        let mut explicit = serde_json::json!({
+            "instructions": "system prompt",
+            "tools": [{ "type": "function", "name": "f" }],
+            "parallel_tool_calls": false,
+        });
+        normalize_codex_official_responses_body(&mut explicit, false);
+        assert_eq!(explicit["instructions"], serde_json::json!("system prompt"));
+        assert_eq!(
+            explicit["tools"],
+            serde_json::json!([{ "type": "function", "name": "f" }])
+        );
+        assert_eq!(explicit["parallel_tool_calls"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn normalize_codex_official_responses_body_compact_keeps_compact_contract_fields() {
+        // CompactionInput follows its own contract: no whitelist filtering, no
+        // Responses required-field/include handling, and no store/stream
+        // injection (codex-rs's own compact client never sends them).
+        let mut body = serde_json::json!({
+            "model": "gpt-5.6-luna",
+            "input": [{ "type": "message", "role": "user", "content": [] }],
+            "max_output_tokens": 512,
+            "stream": false,
+        });
+
+        normalize_codex_official_responses_body(&mut body, true);
+
+        assert_eq!(
+            body["max_output_tokens"],
+            serde_json::json!(512),
+            "compact path must not whitelist-filter CompactionInput fields"
+        );
+        // The client's own stream value passes through untouched; store is not
+        // injected (both are outside the CompactionInput contract).
+        assert_eq!(body["stream"], serde_json::json!(false));
+        let object = body.as_object().unwrap();
+        assert!(!object.contains_key("store"));
+        assert!(!object.contains_key("include"));
+        assert!(!object.contains_key("instructions"));
+        assert!(!object.contains_key("parallel_tool_calls"));
+
+        // String input is still wrapped on the compact path.
+        let mut body = serde_json::json!({ "input": "summarize" });
+        normalize_codex_official_responses_body(&mut body, true);
+        assert_eq!(
+            body["input"],
+            serde_json::json!([{
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "summarize" }],
+            }])
+        );
+    }
+
+    #[test]
+    fn normalize_codex_official_responses_body_forces_stream_true() {
+        // Client stream:false is overridden — the upstream is streaming-only and
+        // the response side aggregates SSE back into JSON for such clients.
+        let mut body = serde_json::json!({ "model": "m", "stream": false });
+        normalize_codex_official_responses_body(&mut body, false);
+        assert_eq!(body["stream"], serde_json::json!(true));
+
+        let mut missing = serde_json::json!({ "model": "m" });
+        normalize_codex_official_responses_body(&mut missing, false);
+        assert_eq!(missing["stream"], serde_json::json!(true));
+
+        let mut explicit_true = serde_json::json!({ "model": "m", "stream": true });
+        normalize_codex_official_responses_body(&mut explicit_true, false);
+        assert_eq!(explicit_true["stream"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn normalize_codex_official_responses_body_ignores_non_object() {
+        let mut body = serde_json::json!(["not", "an", "object"]);
+        normalize_codex_official_responses_body(&mut body, false);
+        assert_eq!(body, serde_json::json!(["not", "an", "object"]));
     }
 
     #[test]
