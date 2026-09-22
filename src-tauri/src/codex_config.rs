@@ -728,29 +728,6 @@ pub fn codex_auth_matches_recorded_managed_oauth(
         })
 }
 
-/// Verify that a proxied Codex request still uses the exact live access token
-/// owned by the selected local account. Workspace IDs alone are not sufficient:
-/// different Team users can share one value.
-pub(crate) fn codex_live_auth_matches_managed_request(
-    account_id: &str,
-    request_access_token: &str,
-) -> Result<bool, AppError> {
-    let auth_path = get_codex_auth_path();
-    if !auth_path.exists() {
-        return Ok(false);
-    }
-    let auth: Value = read_json_file(&auth_path)?;
-    if !codex_auth_matches_recorded_managed_oauth(&auth, account_id)? {
-        return Ok(false);
-    }
-    let live_access_token = auth
-        .pointer("/tokens/access_token")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|token| !token.is_empty());
-    Ok(live_access_token == Some(request_access_token.trim()))
-}
-
 pub(crate) fn clear_codex_managed_oauth_live_auth_marker_for_account(
     account_id: &str,
 ) -> Result<(), AppError> {
@@ -4798,16 +4775,6 @@ base_url = "https://single.example.com/v1"
         });
         record_codex_managed_oauth_live_auth(&full_bundle, "local-account-a")
             .expect("record managed auth marker");
-        crate::config::write_json_file(&get_codex_auth_path(), &full_bundle)
-            .expect("write managed live auth");
-        assert!(
-            codex_live_auth_matches_managed_request("local-account-a", "access").unwrap(),
-            "the selected account's exact live bearer must match"
-        );
-        assert!(
-            !codex_live_auth_matches_managed_request("local-account-a", "other-access").unwrap(),
-            "another user's bearer in the same workspace must not match"
-        );
         let managed_id_token = full_bundle
             .pointer("/tokens/id_token")
             .and_then(Value::as_str)

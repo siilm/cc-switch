@@ -39,27 +39,11 @@ use tokio::sync::RwLock;
 
 const PROXY_AUTH_PLACEHOLDER: &str = "PROXY_MANAGED";
 
-fn codex_bearer_access_token(headers: &http::HeaderMap) -> Option<&str> {
-    let authorization = headers
-        .get(http::header::AUTHORIZATION)?
-        .to_str()
-        .ok()?
-        .trim();
-    let mut parts = authorization.split_whitespace();
-    let scheme = parts.next()?;
-    let token = parts.next()?;
-    if !scheme.eq_ignore_ascii_case("bearer") || token.is_empty() || parts.next().is_some() {
-        return None;
-    }
-    Some(token)
-}
-
-fn validate_codex_official_authorization(
-    headers: &http::HeaderMap,
-    provider: &Provider,
-    expected_chatgpt_account_id: Option<&str>,
-    managed_session_matches: Option<bool>,
-) -> Result<(), ProxyError> {
+/// Local gate for **unbound** official cards: the calling Codex client must
+/// present its own usable ChatGPT authorization, which is passed through
+/// unchanged. Bound (managed-account) cards never reach this check — the
+/// forwarder injects their credentials per request (see the call site).
+fn validate_codex_official_authorization(headers: &http::HeaderMap) -> Result<(), ProxyError> {
     let authorization = headers
         .get(http::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
@@ -71,30 +55,54 @@ fn validate_codex_official_authorization(
         Some(value) if value.contains(PROXY_AUTH_PLACEHOLDER) => Err(ProxyError::AuthError(
             "已切换到 OpenAI 官方供应商，请重启 Codex 或新建会话以加载官方登录配置".to_string(),
         )),
-        Some(_) => {
-            let managed_account_id = provider
-                .meta
-                .as_ref()
-                .and_then(|meta| meta.managed_account_id_for("codex_oauth"))
-                .map(|account_id| account_id.trim().to_string())
-                .filter(|account_id| !account_id.is_empty());
-            if managed_account_id.is_some() {
-                let request_account_id = headers
-                    .get("chatgpt-account-id")
-                    .and_then(|value| value.to_str().ok())
-                    .map(str::trim)
-                    .filter(|account_id| !account_id.is_empty());
-                if request_account_id != expected_chatgpt_account_id
-                    || managed_session_matches != Some(true)
-                {
-                    return Err(ProxyError::AuthError(
-                        "当前 Codex 会话未加载所选 ChatGPT 账号，请重启 Codex 或新建会话后重试"
-                            .to_string(),
-                    ));
-                }
-            }
-            Ok(())
-        }
+        Some(_) => Ok(()),
+    }
+}
+
+/// Whether the provider card is bound to a managed ChatGPT account in the
+/// auth center. Bound official cards get managed-token injection and skip the
+/// unbound live-session gate entirely.
+fn has_managed_codex_oauth_account(provider: &Provider) -> bool {
+    provider
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.managed_account_id_for("codex_oauth"))
+        .is_some_and(|account_id| !account_id.trim().is_empty())
+}
+
+/// Whether the endpoint is one of the two canonical Codex Responses paths.
+/// The Codex responses handlers canonicalize the endpoint before forwarding
+/// (`endpoint_with_query` in handlers.rs), so only these forms can arrive
+/// here — the `/v1/...` alias routes registered in server.rs never reach
+/// this check.
+fn is_codex_responses_endpoint(endpoint: &str) -> bool {
+    let path = endpoint.split('?').next().unwrap_or(endpoint);
+    matches!(path, "/responses" | "/responses/compact")
+}
+
+/// ChatGPT Codex backend requires an explicit `store: false` and a list-typed
+/// `input`. Native passthrough clients routed to the official card may omit
+/// both, so fill them in — never overriding client-supplied values.
+fn normalize_codex_official_responses_body(body: &mut Value) {
+    let Some(object) = body.as_object_mut() else {
+        return;
+    };
+    if !object.contains_key("store") {
+        object.insert("store".to_string(), Value::Bool(false));
+    }
+    if let Some(text) = object
+        .get("input")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+    {
+        object.insert(
+            "input".to_string(),
+            serde_json::json!([{
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": text }],
+            }]),
+        );
     }
 }
 
@@ -1200,46 +1208,16 @@ impl RequestForwarder {
         let codex_official_auth_passthrough = matches!(app_type, AppType::Codex)
             && super::providers::is_codex_official_provider(provider);
 
-        if codex_official_auth_passthrough {
-            let (expected_chatgpt_account_id, managed_session_matches) = match provider
-                .meta
-                .as_ref()
-                .and_then(|meta| meta.managed_account_id_for("codex_oauth"))
-            {
-                Some(local_account_id) => {
-                    let app_handle = self.app_handle.as_ref().ok_or_else(|| {
-                        ProxyError::AuthError("Codex OAuth 认证不可用（无 AppHandle）".to_string())
-                    })?;
-                    let codex_state = app_handle.state::<CodexOAuthState>();
-                    let chatgpt_account_id = codex_state
-                        .0
-                        .chatgpt_account_id_for_account(&local_account_id)
-                        .await
-                        .map_err(|error| {
-                            ProxyError::AuthError(format!("Codex OAuth 账号解析失败: {error}"))
-                        })?;
-                    let session_matches = match codex_bearer_access_token(headers) {
-                        Some(access_token) => {
-                            crate::codex_config::codex_live_auth_matches_managed_request(
-                                &local_account_id,
-                                access_token,
-                            )
-                            .map_err(|error| {
-                                ProxyError::AuthError(format!("Codex OAuth 会话校验失败: {error}"))
-                            })?
-                        }
-                        None => false,
-                    };
-                    (Some(chatgpt_account_id), Some(session_matches))
-                }
-                None => (None, None),
-            };
-            validate_codex_official_authorization(
-                headers,
-                provider,
-                expected_chatgpt_account_id.as_deref(),
-                managed_session_matches,
-            )?;
+        // Managed-account official cards get their credentials injected by the
+        // forwarder below via CodexOAuthManager (the same mechanism the Claude
+        // route's codex_oauth providers use), so the local live-session gate
+        // (marker file + exact ~/.codex/auth.json token match) must not apply:
+        // routed clients don't hold the live CLI token. Only unbound official
+        // cards — which pass the calling Codex client's own ChatGPT
+        // authorization through — keep the placeholder/empty-header checks.
+        let has_managed_codex_account = has_managed_codex_oauth_account(provider);
+        if codex_official_auth_passthrough && !has_managed_codex_account {
+            validate_codex_official_authorization(headers)?;
         }
 
         // 应用模型映射（独立于格式转换）
@@ -1631,6 +1609,9 @@ impl RequestForwarder {
                 adapter.transform_request(mapped_body, provider)?
             }
         } else {
+            if codex_official_auth_passthrough && is_codex_responses_endpoint(endpoint) {
+                normalize_codex_official_responses_body(&mut mapped_body);
+            }
             mapped_body
         };
 
@@ -1724,6 +1705,10 @@ impl RequestForwarder {
         // Codex OAuth 需要注入的 ChatGPT-Account-Id（在动态 token 获取期间填充）
         let mut codex_oauth_account_id: Option<String> = None;
         let mut should_send_codex_oauth_session_headers = false;
+        // Set when the managed Codex OAuth token was injected into auth_headers.
+        // The proxy then owns originator/version/chatgpt-account-id outright and
+        // must discard the client's copies instead of passing them through.
+        let mut injected_codex_oauth = false;
 
         // 获取认证头（提前准备，用于内联替换），同时保留仅用于日志脱敏的
         // 精确认证材料。实际日志永远不输出这些值。
@@ -1813,6 +1798,7 @@ impl RequestForwarder {
                         Ok(token) => {
                             auth = AuthInfo::new(token, AuthStrategy::CodexOAuth);
                             should_send_codex_oauth_session_headers = true;
+                            injected_codex_oauth = true;
                             // 本地账号 ID 只用于绑定；请求头必须使用上游 workspace ID。
                             codex_oauth_account_id = match resolved_account_id.as_deref() {
                                 Some(id) => Some(
@@ -2087,9 +2073,12 @@ impl RequestForwarder {
                 // Codex official account cards deliberately keep credentials
                 // out of provider storage. `requires_openai_auth = true` makes
                 // Codex send the active ChatGPT authorization, which must reach
-                // the official upstream unchanged. Other credential headers
-                // are still discarded.
-                if codex_official_auth_passthrough && key_str.eq_ignore_ascii_case("authorization")
+                // the official upstream unchanged — but only when the proxy is
+                // NOT injecting a managed account token itself. Managed cards
+                // replace the client's Authorization with the injected one.
+                if codex_official_auth_passthrough
+                    && !injected_codex_oauth
+                    && key_str.eq_ignore_ascii_case("authorization")
                 {
                     saw_auth = true;
                     ordered_headers.append(key.clone(), value.clone());
@@ -2116,6 +2105,18 @@ impl RequestForwarder {
             // The full set lives in `is_codex_client_fingerprint_header` so it stays in one
             // place. (HeaderName is lowercased by the http crate, so a direct match is safe.)
             if codex_responses_to_anthropic && is_codex_client_fingerprint_header(key_str) {
+                continue;
+            }
+
+            // --- Managed Codex OAuth 注入：凭据指纹头由代理全权生成 ---
+            // auth_headers 已携带 originator/version，chatgpt-account-id 在
+            // 循环结束后按账号绑定 insert；客户端自带的副本必须丢弃，避免
+            // 上游收到重复且可能不一致的头。
+            if injected_codex_oauth
+                && (key_str.eq_ignore_ascii_case("originator")
+                    || key_str.eq_ignore_ascii_case("version")
+                    || key_str.eq_ignore_ascii_case("chatgpt-account-id"))
+            {
                 continue;
             }
 
@@ -4708,50 +4709,86 @@ mod tests {
             http::header::AUTHORIZATION,
             HeaderValue::from_static("Bearer PROXY_MANAGED"),
         );
-        let mut provider = test_provider_with_type(None);
-        provider.id = "codex-official".to_string();
-        provider.category = Some("official".to_string());
-        let error = validate_codex_official_authorization(&headers, &provider, None, None)
+        let error = validate_codex_official_authorization(&headers)
             .expect_err("stale placeholder must be rejected");
         assert!(matches!(error, ProxyError::AuthError(message) if message.contains("重启 Codex")));
     }
 
     #[test]
-    fn managed_codex_official_rejects_a_different_session_account() {
-        let mut provider = test_provider_with_type(Some("codex_oauth"));
-        provider.category = Some("official".to_string());
-        provider.meta.as_mut().expect("provider meta").auth_binding =
+    fn managed_codex_official_binding_is_detected_for_official_cards() {
+        // Bound official cards resolve a CodexOAuth placeholder and are handled
+        // by managed-token injection; only unbound cards hit the local
+        // live-session gate (empty / PROXY_MANAGED authorization checks).
+        let mut bound = test_provider_with_type(Some("codex_oauth"));
+        bound.category = Some("official".to_string());
+        bound.meta.as_mut().expect("provider meta").auth_binding =
             Some(crate::provider::AuthBinding {
                 source: crate::provider::AuthBindingSource::ManagedAccount,
                 auth_provider: Some("codex_oauth".to_string()),
-                account_id: Some("local-account-b".to_string()),
+                account_id: Some("local-account".to_string()),
             });
+        assert!(has_managed_codex_oauth_account(&bound));
 
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            http::header::AUTHORIZATION,
-            HeaderValue::from_static("Bearer account-a-token"),
-        );
-        headers.insert(
-            "chatgpt-account-id",
-            HeaderValue::from_static("workspace-shared"),
-        );
-        let error = validate_codex_official_authorization(
-            &headers,
-            &provider,
-            Some("workspace-shared"),
-            Some(false),
-        )
-        .expect_err("another user's bearer in the same workspace must be rejected");
-        assert!(matches!(error, ProxyError::AuthError(message) if message.contains("重启 Codex")));
+        let unbound = test_provider_with_type(None);
+        assert!(!has_managed_codex_oauth_account(&unbound));
+    }
 
-        validate_codex_official_authorization(
-            &headers,
-            &provider,
-            Some("workspace-shared"),
-            Some(true),
-        )
-        .expect("the selected account may pass through");
+    #[test]
+    fn codex_official_responses_endpoint_matching() {
+        // Handlers canonicalize the endpoint before forwarding
+        // (endpoint_with_query), so the "/v1/..." alias routes never reach
+        // this check.
+        assert!(is_codex_responses_endpoint("/responses"));
+        assert!(is_codex_responses_endpoint("/responses?stream=true"));
+        assert!(is_codex_responses_endpoint("/responses/compact"));
+        assert!(is_codex_responses_endpoint("/responses/compact?foo=bar"));
+        assert!(!is_codex_responses_endpoint("/v1/responses"));
+        assert!(!is_codex_responses_endpoint("/v1/v1/responses"));
+        assert!(!is_codex_responses_endpoint("/v1/responses/compact"));
+        assert!(!is_codex_responses_endpoint("/chat/completions"));
+        assert!(!is_codex_responses_endpoint("/v1/chat/completions"));
+        assert!(!is_codex_responses_endpoint("/v1/messages"));
+    }
+
+    #[test]
+    fn normalize_codex_official_responses_body_fills_store_and_wraps_input() {
+        let mut body = serde_json::json!({
+            "model": "gpt-5.6-luna",
+            "input": "hi",
+        });
+        normalize_codex_official_responses_body(&mut body);
+        assert_eq!(body["store"], serde_json::json!(false));
+        assert_eq!(
+            body["input"],
+            serde_json::json!([{
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "hi" }],
+            }])
+        );
+
+        // Explicit client values are never overridden.
+        let mut explicit = serde_json::json!({
+            "store": true,
+            "input": [{ "type": "message", "role": "user", "content": [] }],
+        });
+        normalize_codex_official_responses_body(&mut explicit);
+        assert_eq!(explicit["store"], serde_json::json!(true));
+        assert_eq!(
+            explicit["input"],
+            serde_json::json!([{ "type": "message", "role": "user", "content": [] }])
+        );
+
+        // Non-string input (array/object) passes through untouched.
+        let mut list_input = serde_json::json!({ "input": [{ "type": "message" }] });
+        normalize_codex_official_responses_body(&mut list_input);
+        assert_eq!(
+            list_input["input"],
+            serde_json::json!([{ "type": "message" }])
+        );
+        let mut object_input = serde_json::json!({ "input": { "text": "hi" } });
+        normalize_codex_official_responses_body(&mut object_input);
+        assert_eq!(object_input["input"], serde_json::json!({ "text": "hi" }));
     }
 
     #[test]

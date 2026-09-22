@@ -5,6 +5,7 @@
 //! ## 客户端检测
 //! 支持检测官方 Codex 客户端 (codex_vscode, codex_cli_rs)
 
+use super::codex_oauth_auth::{CODEX_OAUTH_CLIENT_VERSION, CODEX_OAUTH_ORIGINATOR};
 use super::{AuthInfo, AuthStrategy, ProviderAdapter};
 use crate::provider::{CodexChatReasoningConfig, Provider};
 use crate::proxy::error::ProxyError;
@@ -1026,6 +1027,26 @@ impl ProviderAdapter for CodexAdapter {
             ));
         }
 
+        // Managed ChatGPT account (OpenAI Official card bound in the auth
+        // center): placeholder credentials only; the real access_token and
+        // workspace ID are resolved per-request by the forwarder via
+        // CodexOAuthManager — the same mechanism the Claude route's
+        // codex_oauth providers already use. This replaces the old local
+        // live-session gate (marker + exact auth.json token match), which
+        // broke routing for every client that did not hold the exact live
+        // ~/.codex/auth.json token.
+        if provider
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.managed_account_id_for("codex_oauth"))
+            .is_some_and(|account_id| !account_id.trim().is_empty())
+        {
+            return Some(AuthInfo::new(
+                "codex_oauth_placeholder".to_string(),
+                AuthStrategy::CodexOAuth,
+            ));
+        }
+
         // Anthropic upstream: the auth field is chosen by the user in the UI (meta.apiKeyField).
         //   ANTHROPIC_API_KEY    → x-api-key (AuthStrategy::Anthropic)
         //   ANTHROPIC_AUTH_TOKEN → Authorization: Bearer (default, AuthStrategy::Bearer)
@@ -1096,6 +1117,25 @@ impl ProviderAdapter for CodexAdapter {
                 http::HeaderName::from_static("x-api-key"),
                 auth_header_value(&auth.api_key)?,
             )]);
+        }
+        if auth.strategy == AuthStrategy::CodexOAuth {
+            // The forwarder injects the managed access_token into auth.api_key.
+            // originator/version identify a Codex CLI to the ChatGPT backend;
+            // chatgpt-account-id is appended separately by the forwarder.
+            return Ok(vec![
+                (
+                    http::HeaderName::from_static("authorization"),
+                    auth_header_value(&bearer)?,
+                ),
+                (
+                    http::HeaderName::from_static("originator"),
+                    http::HeaderValue::from_static(CODEX_OAUTH_ORIGINATOR),
+                ),
+                (
+                    http::HeaderName::from_static("version"),
+                    http::HeaderValue::from_static(CODEX_OAUTH_CLIENT_VERSION),
+                ),
+            ]);
         }
         Ok(vec![(
             http::HeaderName::from_static("authorization"),
@@ -1194,7 +1234,33 @@ context_window = 500000
                 .expect("official base url"),
             "https://chatgpt.com/backend-api/codex"
         );
-        assert!(adapter.extract_auth(&provider).is_none());
+        let managed_auth = adapter
+            .extract_auth(&provider)
+            .expect("managed official card resolves a CodexOAuth placeholder");
+        assert_eq!(managed_auth.strategy, AuthStrategy::CodexOAuth);
+        assert!(managed_auth.api_key.contains("codex_oauth_placeholder"));
+        assert_eq!(
+            adapter
+                .get_auth_headers(&AuthInfo::new(
+                    "managed-token".to_string(),
+                    AuthStrategy::CodexOAuth,
+                ))
+                .expect("codex oauth headers"),
+            vec![
+                (
+                    http::HeaderName::from_static("authorization"),
+                    http::HeaderValue::from_str("Bearer managed-token").unwrap(),
+                ),
+                (
+                    http::HeaderName::from_static("originator"),
+                    http::HeaderValue::from_static(CODEX_OAUTH_ORIGINATOR),
+                ),
+                (
+                    http::HeaderName::from_static("version"),
+                    http::HeaderValue::from_static(CODEX_OAUTH_CLIENT_VERSION),
+                ),
+            ]
+        );
         assert_eq!(
             adapter.build_url(
                 "https://chatgpt.com/backend-api/codex",
