@@ -121,8 +121,15 @@ const CODEX_OFFICIAL_RESPONSES_WHITELIST: &[&str] = &[
 ///   `ResponsesApiRequest` contract (codex-rs/codex-api/src/common.rs):
 ///   whitelist-filter top-level fields, force `include` to carry
 ///   `reasoning.encrypted_content`, fill the required fields
-///   (`instructions`/`tools`/`parallel_tool_calls`) with defaults, and force
-///   `stream: true` (the upstream is streaming-only).
+///   (`instructions`/`tools`/`parallel_tool_calls`) with defaults, force
+///   `stream: true` (the upstream is streaming-only), and fill `tool_choice`
+///   with `"auto"`. The `tool_choice` fill is not a contract requirement —
+///   the backend accepts its absence — but requests carrying no codex-rs
+///   signature fields at all (`tool_choice`/`parallel_tool_calls`/
+///   `client_metadata`) are routed onto a degraded prompt-cache path
+///   (measured: ~35–60% cache hit for bare Responses clients vs ~96% with
+///   the fill). `"auto"` is the API default, so the fill is behavior-neutral;
+///   only the field's presence matters to the upstream gate.
 /// - `compact == true` (`/responses/compact`): the upstream contract is the
 ///   distinct codex-rs `CompactionInput` struct (same file): a smaller field
 ///   set with no `store`/`stream`/`tool_choice`/`include`, answered by a plain
@@ -209,6 +216,12 @@ fn normalize_codex_official_responses_body(body: &mut Value, compact: bool) {
     object
         .entry("parallel_tool_calls".to_string())
         .or_insert_with(|| Value::Bool(true));
+    // tool_choice 不是契约必填项，但缺全部 codex 签名字段的裸请求会被上游
+    // 分到降级缓存路径（实测命中 ~35–60% → 补齐后 ~96%）。"auto" 即 API
+    // 默认行为，注入不改变客户端语义；门控只看字段存在性，与值无关。
+    object
+        .entry("tool_choice".to_string())
+        .or_insert_with(|| Value::String("auto".to_string()));
 
     // —— 强制 stream = true ——
     // codex-rs 硬编码 true；即便客户端传 stream:false 也覆盖，
@@ -5084,11 +5097,15 @@ mod tests {
         assert_eq!(body["instructions"], serde_json::json!(""));
         assert_eq!(body["tools"], serde_json::json!([]));
         assert_eq!(body["parallel_tool_calls"], serde_json::json!(true));
+        // tool_choice="auto" ungated the upstream prompt-cache path for bare
+        // clients; it is the API default, so filling it is behavior-neutral.
+        assert_eq!(body["tool_choice"], serde_json::json!("auto"));
 
         let mut explicit = serde_json::json!({
             "instructions": "system prompt",
             "tools": [{ "type": "function", "name": "f" }],
             "parallel_tool_calls": false,
+            "tool_choice": "required",
         });
         normalize_codex_official_responses_body(&mut explicit, false);
         assert_eq!(explicit["instructions"], serde_json::json!("system prompt"));
@@ -5097,6 +5114,7 @@ mod tests {
             serde_json::json!([{ "type": "function", "name": "f" }])
         );
         assert_eq!(explicit["parallel_tool_calls"], serde_json::json!(false));
+        assert_eq!(explicit["tool_choice"], serde_json::json!("required"));
     }
 
     #[test]
@@ -5126,6 +5144,9 @@ mod tests {
         assert!(!object.contains_key("include"));
         assert!(!object.contains_key("instructions"));
         assert!(!object.contains_key("parallel_tool_calls"));
+        // tool_choice is also outside the CompactionInput contract: injecting it
+        // here would recreate the 400 this normalization exists to prevent.
+        assert!(!object.contains_key("tool_choice"));
 
         // String input is still wrapped on the compact path.
         let mut body = serde_json::json!({ "input": "summarize" });
