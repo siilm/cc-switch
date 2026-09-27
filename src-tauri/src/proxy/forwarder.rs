@@ -307,6 +307,41 @@ fn codex_session_uuid_from_cache_key(cache_key: &str) -> String {
     )
 }
 
+/// 客户端请求是否已自带会话亲和头（任一变体均视为已提供，原样透传优先）。
+fn client_provided_session_header(headers: &http::HeaderMap) -> bool {
+    ["session-id", "session_id", "x-session-id"]
+        .iter()
+        .any(|name| {
+            headers
+                .get(*name)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| !value.trim().is_empty())
+        })
+}
+
+/// 官方卡 native /responses 路由的会话亲和头合成。
+///
+/// 上游按 `session-id` 头做 prompt 缓存亲和（codex-rs client.rs 注释：
+/// "ChatGPT derives cache affinity from the Responses session-id header"）。
+/// 裸客户端（如 Kimi Code）不带该头时实测缓存命中 0–35%，补齐后 >90%。
+///
+/// 返回 None 的情况：`None` 模式（纯透传对照）、客户端已自带会话头
+/// （透传优先）、body 无 prompt_cache_key（没有可派生的稳定值——随机值
+/// 每次不同反而破坏亲和）。
+fn synthesized_codex_session_headers(
+    headers: &http::HeaderMap,
+    body: &Value,
+    mode: CodexNormalizeMode,
+) -> Option<String> {
+    if mode == CodexNormalizeMode::None || client_provided_session_header(headers) {
+        return None;
+    }
+    body.get("prompt_cache_key")
+        .and_then(Value::as_str)
+        .filter(|key| !key.is_empty())
+        .map(codex_session_uuid_from_cache_key)
+}
+
 pub struct ForwardResult {
     pub response: ProxyResponse,
     pub provider: Provider,
@@ -2483,6 +2518,27 @@ impl RequestForwarder {
         // 只发送客户端提供的 session_id；生成的 UUID 每次不同，反而会破坏前缀缓存。
         for (name, value) in codex_oauth_session_headers {
             ordered_headers.insert(name, value);
+        }
+
+        // 官方卡 native /responses 路由：客户端未带会话头时，从 prompt_cache_key
+        // 派生稳定 UUID 合成连字符形态的 session-id/thread-id/x-client-request-id
+        // （codex-rs 的真实形态）。上游按 session-id 头做缓存亲和，缺失会被分到
+        // 降级缓存路径（实测裸客户端 0–35% → 补齐后 >90%）。
+        if codex_official_auth_passthrough && is_codex_responses_endpoint(endpoint) {
+            if let Some(session_uuid) = synthesized_codex_session_headers(
+                headers,
+                body,
+                self.rectifier_config.codex_normalize_mode,
+            ) {
+                if let Ok(value) = http::HeaderValue::from_str(&session_uuid) {
+                    log::debug!(
+                        "[Codex] Synthesized session-id/thread-id headers from prompt_cache_key"
+                    );
+                    ordered_headers.insert("session-id", value.clone());
+                    ordered_headers.insert("thread-id", value.clone());
+                    ordered_headers.insert("x-client-request-id", value);
+                }
+            }
         }
 
         // 序列化请求体。GET/HEAD 是 idempotent/safe 方法，按 HTTP 语义不应携带 body；
@@ -5418,6 +5474,50 @@ mod tests {
         let b = codex_session_uuid_from_cache_key("session_b");
         assert_eq!(a1, a2);
         assert_ne!(a1, b);
+    }
+
+    #[test]
+    fn synthesized_codex_session_headers_derive_from_cache_key() {
+        let headers = HeaderMap::new();
+        let body = json!({ "prompt_cache_key": "session_abc-123" });
+        let uuid = synthesized_codex_session_headers(&headers, &body, CodexNormalizeMode::Full)
+            .expect("bare client with cache key gets a synthesized uuid");
+        assert_eq!(uuid, codex_session_uuid_from_cache_key("session_abc-123"));
+    }
+
+    #[test]
+    fn synthesized_codex_session_headers_respect_client_and_mode() {
+        let body = json!({ "prompt_cache_key": "session_abc-123" });
+
+        // None 模式（纯透传对照）不合成。
+        let headers = HeaderMap::new();
+        assert!(
+            synthesized_codex_session_headers(&headers, &body, CodexNormalizeMode::None).is_none()
+        );
+
+        // 客户端已带会话头（任一变体）时不合成，透传优先。
+        for name in ["session-id", "session_id", "x-session-id"] {
+            let mut headers = HeaderMap::new();
+            headers.insert(name, HeaderValue::from_static("client-owned"));
+            assert!(
+                synthesized_codex_session_headers(&headers, &body, CodexNormalizeMode::Full)
+                    .is_none(),
+                "client-provided {name} must win"
+            );
+        }
+
+        // 无 prompt_cache_key 时不合成（随机值无法承担会话身份）。
+        let headers = HeaderMap::new();
+        let no_key = json!({ "model": "m" });
+        assert!(
+            synthesized_codex_session_headers(&headers, &no_key, CodexNormalizeMode::Full)
+                .is_none()
+        );
+        let empty_key = json!({ "prompt_cache_key": "" });
+        assert!(
+            synthesized_codex_session_headers(&headers, &empty_key, CodexNormalizeMode::Full)
+                .is_none()
+        );
     }
 
     #[test]
