@@ -3,7 +3,7 @@
 //! 用于自动修复 Anthropic API 中因 thinking budget 约束导致的请求错误。
 //! 当上游 API 返回 budget_tokens 相关错误时，系统会自动调整 budget 参数并重试。
 
-use super::types::RectifierConfig;
+use super::types::{CodexNormalizeMode, RectifierConfig};
 use serde_json::Value;
 
 /// 最大 thinking budget tokens
@@ -150,6 +150,7 @@ mod tests {
             request_thinking_budget: true,
             request_media_fallback: true,
             request_media_heuristic: true,
+            codex_normalize_mode: CodexNormalizeMode::Full,
         }
     }
 
@@ -160,6 +161,7 @@ mod tests {
             request_thinking_budget: false,
             request_media_fallback: true,
             request_media_heuristic: true,
+            codex_normalize_mode: CodexNormalizeMode::Full,
         }
     }
 
@@ -170,6 +172,7 @@ mod tests {
             request_thinking_budget: true,
             request_media_fallback: true,
             request_media_heuristic: true,
+            codex_normalize_mode: CodexNormalizeMode::Full,
         }
     }
 

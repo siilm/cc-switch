@@ -412,7 +412,24 @@
         "mediaFallback": "不支援圖片降級",
         "mediaFallbackDescription": "當供應商不支援圖片輸入時（已宣告純文字能力，或上游回傳不支援圖片的錯誤），自動將圖片區塊替換為 [Unsupported Image] 標記，使對話不中斷",
         "mediaHeuristic": "純文字模型預判",
-        "mediaHeuristicDescription": "傳送前依內建的已確認純文字模型登錄表移除圖片。關閉只會停用代理的登錄表預判；已宣告純文字模型的處理與上游錯誤兜底仍會保留，且不會改變 Codex 模型目錄的能力宣告"
+        "mediaHeuristicDescription": "傳送前依內建的已確認純文字模型登錄表移除圖片。關閉只會停用代理的登錄表預判；已宣告純文字模型的處理與上游錯誤兜底仍會保留，且不會改變 Codex 模型目錄的能力宣告",
+        "codexNormalize": {
+          "title": "Codex 整流",
+          "description": "官方 ChatGPT 卡原生 /responses 路由的請求正規化模式（獨立於整流器總開關）",
+          "mode": "正規化模式",
+          "modeNames": {
+            "none": "純透傳（除錯）",
+            "signature": "最小簽名",
+            "full": "完整正規化（預設）",
+            "fullClientMeta": "完整 + 工作階段識別"
+          },
+          "modes": {
+            "none": "不做任何正規化，裸用戶端欄位可能觸發上游 400，僅用於除錯對照",
+            "signature": "僅注入 store:false 與 tool_choice=auto 的最小簽名，即可恢復快取命中",
+            "full": "白名單過濾 + 必填欄位兜底 + include/store/stream/tool_choice 注入",
+            "fullClientMeta": "在完整正規化基礎上，額外從 prompt_cache_key 派生注入 client_metadata 工作階段識別"
+          }
+        }
       },
       "optimizer": {
         "title": "Bedrock 請求最佳化工具",

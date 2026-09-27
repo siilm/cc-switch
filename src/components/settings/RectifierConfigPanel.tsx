@@ -4,10 +4,24 @@ import { toast } from "sonner";
 import { Switch } from "@/components/ui/switch";
 import { Label } from "@/components/ui/label";
 import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import {
   settingsApi,
   type RectifierConfig,
   type OptimizerConfig,
 } from "@/lib/api/settings";
+
+const CODEX_NORMALIZE_MODES = [
+  "none",
+  "signature",
+  "full",
+  "fullClientMeta",
+] as const;
 
 export function RectifierConfigPanel() {
   const { t } = useTranslation();
@@ -17,6 +31,7 @@ export function RectifierConfigPanel() {
     requestThinkingBudget: true,
     requestMediaFallback: true,
     requestMediaHeuristic: true,
+    codexNormalizeMode: "full",
   });
   const [optimizerConfig, setOptimizerConfig] = useState<OptimizerConfig>({
     enabled: false,
@@ -141,6 +156,49 @@ export function RectifierConfigPanel() {
               handleChange({ requestMediaHeuristic: checked })
             }
           />
+        </div>
+      </div>
+
+      <div className="border-t pt-6 mt-6">
+        <div className="space-y-1 mb-4">
+          <h3 className="text-sm font-medium">
+            {t("settings.advanced.rectifier.codexNormalize.title")}
+          </h3>
+          <p className="text-xs text-muted-foreground">
+            {t("settings.advanced.rectifier.codexNormalize.description")}
+          </p>
+        </div>
+        <div className="flex items-center justify-between">
+          <div className="space-y-0.5">
+            <Label>{t("settings.advanced.rectifier.codexNormalize.mode")}</Label>
+            <p className="text-xs text-muted-foreground">
+              {t(
+                `settings.advanced.rectifier.codexNormalize.modes.${config.codexNormalizeMode}`,
+              )}
+            </p>
+          </div>
+          <Select
+            value={config.codexNormalizeMode}
+            onValueChange={(value) =>
+              handleChange({
+                codexNormalizeMode:
+                  value as RectifierConfig["codexNormalizeMode"],
+              })
+            }
+          >
+            <SelectTrigger className="w-[180px]">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {CODEX_NORMALIZE_MODES.map((mode) => (
+                <SelectItem key={mode} value={mode}>
+                  {t(
+                    `settings.advanced.rectifier.codexNormalize.modeNames.${mode}`,
+                  )}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
         </div>
       </div>
 

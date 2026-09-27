@@ -19,7 +19,9 @@ use super::{
     thinking_rectifier::{
         normalize_thinking_type, rectify_anthropic_request, should_rectify_thinking_signature,
     },
-    types::{CopilotOptimizerConfig, OptimizerConfig, ProxyStatus, RectifierConfig},
+    types::{
+        CodexNormalizeMode, CopilotOptimizerConfig, OptimizerConfig, ProxyStatus, RectifierConfig,
+    },
     ProxyError,
 };
 use crate::commands::{CodexOAuthState, CopilotAuthState, XaiOAuthState};
@@ -115,10 +117,15 @@ const CODEX_OFFICIAL_RESPONSES_WHITELIST: &[&str] = &[
 ];
 
 /// Normalize a native-passthrough Responses request body for the official
-/// ChatGPT Codex backend.
+/// ChatGPT Codex backend, gated by `mode` (RectifierConfig.codex_normalize_mode).
 ///
-/// - `compact == false` (`/responses`): enforce the codex-rs
-///   `ResponsesApiRequest` contract (codex-rs/codex-api/src/common.rs):
+/// - `CodexNormalizeMode::None`: pure passthrough (debug control group). Bare
+///   client fields may trip the upstream whitelist and 400 — that is the
+///   point of the control group.
+/// - `CodexNormalizeMode::Signature`: minimal codex signature — whitelist
+///   filter + `store: false` + `tool_choice: "auto"` fills only.
+/// - `CodexNormalizeMode::Full`: enforce the codex-rs `ResponsesApiRequest`
+///   contract (codex-rs/codex-api/src/common.rs) on `/responses`:
 ///   whitelist-filter top-level fields, force `include` to carry
 ///   `reasoning.encrypted_content`, fill the required fields
 ///   (`instructions`/`tools`/`parallel_tool_calls`) with defaults, force
@@ -130,18 +137,30 @@ const CODEX_OFFICIAL_RESPONSES_WHITELIST: &[&str] = &[
 ///   (measured: ~35–60% cache hit for bare Responses clients vs ~96% with
 ///   the fill). `"auto"` is the API default, so the fill is behavior-neutral;
 ///   only the field's presence matters to the upstream gate.
+/// - `CodexNormalizeMode::FullClientMeta`: `Full` + fill `client_metadata`
+///   with session ids derived from `prompt_cache_key` (skipped when the
+///   client sends its own `client_metadata` or no cache key is present).
+///
 /// - `compact == true` (`/responses/compact`): the upstream contract is the
 ///   distinct codex-rs `CompactionInput` struct (same file): a smaller field
 ///   set with no `store`/`stream`/`tool_choice`/`include`, answered by a plain
 ///   JSON (non-SSE) body. The body passes through unfiltered and `store`/
 ///   `stream` are NOT injected — adding them would recreate the very
 ///   `400 Unsupported parameter` this normalization exists to prevent. Only a
-///   string `input` is wrapped into a list.
+///   string `input` is wrapped into a list. All modes except `None` share
+///   this behavior.
 ///
 /// Never overrides explicit client values except `stream` on `/responses`
 /// (codex-rs hardcodes `stream: true`; a client asking for `stream: false`
 /// gets the SSE stream aggregated back into JSON on the response side).
-fn normalize_codex_official_responses_body(body: &mut Value, compact: bool) {
+fn normalize_codex_official_responses_body(
+    body: &mut Value,
+    compact: bool,
+    mode: CodexNormalizeMode,
+) {
+    if mode == CodexNormalizeMode::None {
+        return;
+    }
     let Some(object) = body.as_object_mut() else {
         return;
     };
@@ -190,6 +209,19 @@ fn normalize_codex_official_responses_body(body: &mut Value, compact: bool) {
         object.insert("store".to_string(), Value::Bool(false));
     }
 
+    // tool_choice 不是契约必填项，但缺全部 codex 签名字段的裸请求会被上游
+    // 分到降级缓存路径（实测命中 ~35–60% → 补齐后 ~96%）。"auto" 即 API
+    // 默认行为，注入不改变客户端语义；门控只看字段存在性，与值无关。
+    object
+        .entry("tool_choice".to_string())
+        .or_insert_with(|| Value::String("auto".to_string()));
+
+    if mode == CodexNormalizeMode::Signature {
+        // 最小签名组到此为止：不做 include/必填字段/stream 处理（对齐调试实验
+        // 中「仅补 tool_choice 即恢复 ~96% 命中」的最小形态）。
+        return;
+    }
+
     // include 必含 reasoning.encrypted_content：无服务端状态 + 无加密回传
     // = 多轮 reasoning 中间态断链（对齐 transform_responses.rs codex_oauth 分支）。
     const REASONING_MARKER: &str = "reasoning.encrypted_content";
@@ -216,17 +248,63 @@ fn normalize_codex_official_responses_body(body: &mut Value, compact: bool) {
     object
         .entry("parallel_tool_calls".to_string())
         .or_insert_with(|| Value::Bool(true));
-    // tool_choice 不是契约必填项，但缺全部 codex 签名字段的裸请求会被上游
-    // 分到降级缓存路径（实测命中 ~35–60% → 补齐后 ~96%）。"auto" 即 API
-    // 默认行为，注入不改变客户端语义；门控只看字段存在性，与值无关。
-    object
-        .entry("tool_choice".to_string())
-        .or_insert_with(|| Value::String("auto".to_string()));
 
     // —— 强制 stream = true ——
     // codex-rs 硬编码 true；即便客户端传 stream:false 也覆盖，
     // 响应侧会把上游 SSE 聚合回单个 JSON 再返回客户端。
     object.insert("stream".to_string(), Value::Bool(true));
+
+    if mode == CodexNormalizeMode::FullClientMeta {
+        // 注入 client_metadata 会话标识：从 prompt_cache_key 派生稳定 UUID
+        // （同会话恒定、跨会话不同）。客户端已带 client_metadata 不覆盖；
+        // 无 prompt_cache_key 时跳过——生成的随机值无法承担会话身份。
+        if !object.contains_key("client_metadata") {
+            match object
+                .get("prompt_cache_key")
+                .and_then(Value::as_str)
+                .filter(|key| !key.is_empty())
+            {
+                Some(cache_key) => {
+                    let session_uuid = codex_session_uuid_from_cache_key(cache_key);
+                    object.insert(
+                        "client_metadata".to_string(),
+                        serde_json::json!({
+                            "session_id": session_uuid,
+                            "thread_id": session_uuid,
+                        }),
+                    );
+                }
+                None => {
+                    log::debug!(
+                        "[Codex] fullClientMeta: no prompt_cache_key, client_metadata not injected"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// 从 prompt_cache_key 派生确定 UUID（sha256 取前 16 字节，置 version=5 /
+/// variant 位，与 UUIDv5 线框格式一致），用于 client_metadata 会话标识。
+fn codex_session_uuid_from_cache_key(cache_key: &str) -> String {
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(cache_key.as_bytes());
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x50; // version 5
+    bytes[8] = (bytes[8] & 0x3f) | 0x80; // variant
+    let hex = bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
 }
 
 pub struct ForwardResult {
@@ -1752,7 +1830,11 @@ impl RequestForwarder {
                     .unwrap_or(endpoint)
                     .ends_with("/compact");
                 codex_official_aggregate_sse = !is_streaming_request(endpoint, body, headers);
-                normalize_codex_official_responses_body(&mut mapped_body, compact);
+                normalize_codex_official_responses_body(
+                    &mut mapped_body,
+                    compact,
+                    self.rectifier_config.codex_normalize_mode,
+                );
             }
             mapped_body
         };
@@ -4960,7 +5042,7 @@ mod tests {
             "model": "gpt-5.6-luna",
             "input": "hi",
         });
-        normalize_codex_official_responses_body(&mut body, false);
+        normalize_codex_official_responses_body(&mut body, false, CodexNormalizeMode::Full);
         assert_eq!(body["store"], serde_json::json!(false));
         assert_eq!(
             body["input"],
@@ -4976,7 +5058,7 @@ mod tests {
             "store": true,
             "input": [{ "type": "message", "role": "user", "content": [] }],
         });
-        normalize_codex_official_responses_body(&mut explicit, false);
+        normalize_codex_official_responses_body(&mut explicit, false, CodexNormalizeMode::Full);
         assert_eq!(explicit["store"], serde_json::json!(true));
         assert_eq!(
             explicit["input"],
@@ -4985,13 +5067,13 @@ mod tests {
 
         // Non-string input (array/object) passes through untouched.
         let mut list_input = serde_json::json!({ "input": [{ "type": "message" }] });
-        normalize_codex_official_responses_body(&mut list_input, false);
+        normalize_codex_official_responses_body(&mut list_input, false, CodexNormalizeMode::Full);
         assert_eq!(
             list_input["input"],
             serde_json::json!([{ "type": "message" }])
         );
         let mut object_input = serde_json::json!({ "input": { "text": "hi" } });
-        normalize_codex_official_responses_body(&mut object_input, false);
+        normalize_codex_official_responses_body(&mut object_input, false, CodexNormalizeMode::Full);
         assert_eq!(object_input["input"], serde_json::json!({ "text": "hi" }));
     }
 
@@ -5015,7 +5097,7 @@ mod tests {
             "access_programs": { "cyber": "standard" },
         });
 
-        normalize_codex_official_responses_body(&mut body, false);
+        normalize_codex_official_responses_body(&mut body, false, CodexNormalizeMode::Full);
 
         let object = body.as_object().expect("body stays an object");
         for dropped in [
@@ -5061,12 +5143,12 @@ mod tests {
 
         // Missing include is created with the marker.
         let mut body = serde_json::json!({ "model": "m" });
-        normalize_codex_official_responses_body(&mut body, false);
+        normalize_codex_official_responses_body(&mut body, false, CodexNormalizeMode::Full);
         assert_eq!(body["include"], serde_json::json!([MARKER]));
 
         // Existing array gains the marker without losing entries.
         let mut body = serde_json::json!({ "include": ["web_search_call.action.sources"] });
-        normalize_codex_official_responses_body(&mut body, false);
+        normalize_codex_official_responses_body(&mut body, false, CodexNormalizeMode::Full);
         assert_eq!(
             body["include"],
             serde_json::json!(["web_search_call.action.sources", MARKER])
@@ -5074,7 +5156,7 @@ mod tests {
 
         // Marker already present: no duplicate.
         let mut body = serde_json::json!({ "include": [MARKER] });
-        normalize_codex_official_responses_body(&mut body, false);
+        normalize_codex_official_responses_body(&mut body, false, CodexNormalizeMode::Full);
         let includes = body["include"].as_array().unwrap();
         assert_eq!(
             includes
@@ -5086,14 +5168,14 @@ mod tests {
 
         // Non-array include is rebuilt around the marker.
         let mut body = serde_json::json!({ "include": MARKER });
-        normalize_codex_official_responses_body(&mut body, false);
+        normalize_codex_official_responses_body(&mut body, false, CodexNormalizeMode::Full);
         assert_eq!(body["include"], serde_json::json!([MARKER]));
     }
 
     #[test]
     fn normalize_codex_official_responses_body_fills_required_defaults_without_overriding() {
         let mut body = serde_json::json!({ "model": "m" });
-        normalize_codex_official_responses_body(&mut body, false);
+        normalize_codex_official_responses_body(&mut body, false, CodexNormalizeMode::Full);
         assert_eq!(body["instructions"], serde_json::json!(""));
         assert_eq!(body["tools"], serde_json::json!([]));
         assert_eq!(body["parallel_tool_calls"], serde_json::json!(true));
@@ -5107,7 +5189,7 @@ mod tests {
             "parallel_tool_calls": false,
             "tool_choice": "required",
         });
-        normalize_codex_official_responses_body(&mut explicit, false);
+        normalize_codex_official_responses_body(&mut explicit, false, CodexNormalizeMode::Full);
         assert_eq!(explicit["instructions"], serde_json::json!("system prompt"));
         assert_eq!(
             explicit["tools"],
@@ -5129,7 +5211,7 @@ mod tests {
             "stream": false,
         });
 
-        normalize_codex_official_responses_body(&mut body, true);
+        normalize_codex_official_responses_body(&mut body, true, CodexNormalizeMode::Full);
 
         assert_eq!(
             body["max_output_tokens"],
@@ -5150,7 +5232,7 @@ mod tests {
 
         // String input is still wrapped on the compact path.
         let mut body = serde_json::json!({ "input": "summarize" });
-        normalize_codex_official_responses_body(&mut body, true);
+        normalize_codex_official_responses_body(&mut body, true, CodexNormalizeMode::Full);
         assert_eq!(
             body["input"],
             serde_json::json!([{
@@ -5166,23 +5248,176 @@ mod tests {
         // Client stream:false is overridden — the upstream is streaming-only and
         // the response side aggregates SSE back into JSON for such clients.
         let mut body = serde_json::json!({ "model": "m", "stream": false });
-        normalize_codex_official_responses_body(&mut body, false);
+        normalize_codex_official_responses_body(&mut body, false, CodexNormalizeMode::Full);
         assert_eq!(body["stream"], serde_json::json!(true));
 
         let mut missing = serde_json::json!({ "model": "m" });
-        normalize_codex_official_responses_body(&mut missing, false);
+        normalize_codex_official_responses_body(&mut missing, false, CodexNormalizeMode::Full);
         assert_eq!(missing["stream"], serde_json::json!(true));
 
         let mut explicit_true = serde_json::json!({ "model": "m", "stream": true });
-        normalize_codex_official_responses_body(&mut explicit_true, false);
+        normalize_codex_official_responses_body(
+            &mut explicit_true,
+            false,
+            CodexNormalizeMode::Full,
+        );
         assert_eq!(explicit_true["stream"], serde_json::json!(true));
     }
 
     #[test]
     fn normalize_codex_official_responses_body_ignores_non_object() {
         let mut body = serde_json::json!(["not", "an", "object"]);
-        normalize_codex_official_responses_body(&mut body, false);
+        normalize_codex_official_responses_body(&mut body, false, CodexNormalizeMode::Full);
         assert_eq!(body, serde_json::json!(["not", "an", "object"]));
+    }
+
+    #[test]
+    fn normalize_codex_official_responses_body_none_mode_is_pure_passthrough() {
+        let mut body = serde_json::json!({
+            "model": "m",
+            "input": "hi",
+            "max_output_tokens": 1024,
+            "temperature": 0.7,
+        });
+        let original = body.clone();
+        normalize_codex_official_responses_body(&mut body, false, CodexNormalizeMode::None);
+        assert_eq!(body, original, "None mode must not touch the body at all");
+
+        // Compact path is also untouched under None.
+        let mut compact_body = serde_json::json!({ "model": "m", "input": "summarize" });
+        normalize_codex_official_responses_body(&mut compact_body, true, CodexNormalizeMode::None);
+        assert_eq!(
+            compact_body,
+            serde_json::json!({ "model": "m", "input": "summarize" })
+        );
+    }
+
+    #[test]
+    fn normalize_codex_official_responses_body_signature_mode_minimal_fill() {
+        let mut body = serde_json::json!({
+            "model": "m",
+            "input": [],
+            "max_output_tokens": 1024,
+        });
+        normalize_codex_official_responses_body(&mut body, false, CodexNormalizeMode::Signature);
+        // Minimal signature set: whitelist filter + store:false + tool_choice:auto.
+        assert!(!body.as_object().unwrap().contains_key("max_output_tokens"));
+        assert_eq!(body["store"], serde_json::json!(false));
+        assert_eq!(body["tool_choice"], serde_json::json!("auto"));
+        // Everything else stays untouched (no include/defaults/stream forcing).
+        let object = body.as_object().unwrap();
+        assert!(!object.contains_key("include"));
+        assert!(!object.contains_key("instructions"));
+        assert!(!object.contains_key("parallel_tool_calls"));
+        assert!(!object.contains_key("stream"));
+        assert!(!object.contains_key("client_metadata"));
+
+        // Explicit tool_choice is authoritative.
+        let mut explicit = serde_json::json!({ "model": "m", "tool_choice": "required" });
+        normalize_codex_official_responses_body(
+            &mut explicit,
+            false,
+            CodexNormalizeMode::Signature,
+        );
+        assert_eq!(explicit["tool_choice"], serde_json::json!("required"));
+
+        // Compact path under Signature: only the shared string-input wrap applies.
+        let mut compact_body = serde_json::json!({ "model": "m", "input": "summarize" });
+        normalize_codex_official_responses_body(
+            &mut compact_body,
+            true,
+            CodexNormalizeMode::Signature,
+        );
+        let object = compact_body.as_object().unwrap();
+        assert!(!object.contains_key("tool_choice"));
+        assert!(!object.contains_key("store"));
+        assert!(compact_body["input"].is_array());
+    }
+
+    #[test]
+    fn normalize_codex_official_responses_body_full_client_meta_injects_session_ids() {
+        // Missing client_metadata is filled from prompt_cache_key-derived ids.
+        let mut body = serde_json::json!({
+            "model": "m",
+            "prompt_cache_key": "session_abc-123",
+        });
+        normalize_codex_official_responses_body(
+            &mut body,
+            false,
+            CodexNormalizeMode::FullClientMeta,
+        );
+        let meta = body["client_metadata"].clone();
+        let session_id = meta["session_id"].as_str().expect("session_id string");
+        assert_eq!(meta["thread_id"], serde_json::json!(session_id));
+        // UUID wire shape (8-4-4-4-12, version 5, variant bits set).
+        let parts: Vec<&str> = session_id.split('-').collect();
+        assert_eq!(
+            parts.iter().map(|part| part.len()).collect::<Vec<_>>(),
+            vec![8, 4, 4, 4, 12]
+        );
+        assert!(parts[2].starts_with('5'));
+
+        // Derivation is stable for the same cache key.
+        let mut again = serde_json::json!({
+            "model": "m",
+            "prompt_cache_key": "session_abc-123",
+        });
+        normalize_codex_official_responses_body(
+            &mut again,
+            false,
+            CodexNormalizeMode::FullClientMeta,
+        );
+        assert_eq!(again["client_metadata"], meta);
+
+        // Explicit client_metadata is never overridden.
+        let mut explicit = serde_json::json!({
+            "model": "m",
+            "prompt_cache_key": "session_abc-123",
+            "client_metadata": { "session_id": "client-owned" },
+        });
+        normalize_codex_official_responses_body(
+            &mut explicit,
+            false,
+            CodexNormalizeMode::FullClientMeta,
+        );
+        assert_eq!(
+            explicit["client_metadata"],
+            serde_json::json!({ "session_id": "client-owned" })
+        );
+
+        // No prompt_cache_key: injection is skipped (a random value cannot
+        // carry session identity).
+        let mut no_key = serde_json::json!({ "model": "m" });
+        normalize_codex_official_responses_body(
+            &mut no_key,
+            false,
+            CodexNormalizeMode::FullClientMeta,
+        );
+        assert!(!no_key.as_object().unwrap().contains_key("client_metadata"));
+
+        // Compact path: client_metadata is outside the CompactionInput contract.
+        let mut compact_body = serde_json::json!({
+            "model": "m",
+            "prompt_cache_key": "session_abc-123",
+        });
+        normalize_codex_official_responses_body(
+            &mut compact_body,
+            true,
+            CodexNormalizeMode::FullClientMeta,
+        );
+        assert!(!compact_body
+            .as_object()
+            .unwrap()
+            .contains_key("client_metadata"));
+    }
+
+    #[test]
+    fn codex_session_uuid_from_cache_key_is_deterministic_and_distinct() {
+        let a1 = codex_session_uuid_from_cache_key("session_a");
+        let a2 = codex_session_uuid_from_cache_key("session_a");
+        let b = codex_session_uuid_from_cache_key("session_b");
+        assert_eq!(a1, a2);
+        assert_ne!(a1, b);
     }
 
     #[test]

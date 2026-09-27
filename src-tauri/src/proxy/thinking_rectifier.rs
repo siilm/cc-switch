@@ -3,7 +3,7 @@
 //! 用于自动修复 Anthropic API 中因签名校验失败导致的请求错误。
 //! 当上游 API 返回签名相关错误时，系统会自动移除有问题的签名字段并重试请求。
 
-use super::types::RectifierConfig;
+use super::types::{CodexNormalizeMode, RectifierConfig};
 use serde_json::Value;
 
 /// 整流结果
@@ -253,6 +253,7 @@ mod tests {
             request_thinking_budget: true,
             request_media_fallback: true,
             request_media_heuristic: true,
+            codex_normalize_mode: CodexNormalizeMode::Full,
         }
     }
 
@@ -263,6 +264,7 @@ mod tests {
             request_thinking_budget: false,
             request_media_fallback: true,
             request_media_heuristic: true,
+            codex_normalize_mode: CodexNormalizeMode::Full,
         }
     }
 
@@ -273,6 +275,7 @@ mod tests {
             request_thinking_budget: true,
             request_media_fallback: true,
             request_media_heuristic: true,
+            codex_normalize_mode: CodexNormalizeMode::Full,
         }
     }
 

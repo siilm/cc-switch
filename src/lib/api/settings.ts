@@ -327,6 +327,7 @@ export interface RectifierConfig {
   requestThinkingBudget: boolean;
   requestMediaFallback: boolean;
   requestMediaHeuristic: boolean;
+  codexNormalizeMode: "none" | "signature" | "full" | "fullClientMeta";
 }
 
 export interface OptimizerConfig {

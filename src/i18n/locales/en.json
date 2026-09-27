@@ -412,7 +412,24 @@
         "mediaFallback": "Unsupported Image Fallback",
         "mediaFallbackDescription": "When a provider does not support image input (it declares text-only capability, or the upstream returns an unsupported-image error), automatically replaces image blocks with an [Unsupported Image] marker so the conversation is not interrupted",
         "mediaHeuristic": "Text-Only Model Preflight",
-        "mediaHeuristicDescription": "Before sending, strips images for models in the built-in confirmed text-only registry. Turning this off only disables the proxy's registry-based preflight; declared text-only handling and upstream-error fallback remain, and Codex model-catalog capability declarations are unchanged"
+        "mediaHeuristicDescription": "Before sending, strips images for models in the built-in confirmed text-only registry. Turning this off only disables the proxy's registry-based preflight; declared text-only handling and upstream-error fallback remain, and Codex model-catalog capability declarations are unchanged",
+        "codexNormalize": {
+          "title": "Codex Normalization",
+          "description": "Request normalization mode for the native /responses route on official ChatGPT cards (independent of the rectifier master switch)",
+          "mode": "Normalize mode",
+          "modeNames": {
+            "none": "Passthrough (debug)",
+            "signature": "Minimal signature",
+            "full": "Full (default)",
+            "fullClientMeta": "Full + session IDs"
+          },
+          "modes": {
+            "none": "No normalization at all; bare client fields may trigger upstream 400s. Debug control only.",
+            "signature": "Fills only store:false and tool_choice=auto — the minimal codex signature that restores cache hits.",
+            "full": "Whitelist filtering + required-field defaults + include/store/stream/tool_choice handling.",
+            "fullClientMeta": "Full mode plus client_metadata session IDs derived from prompt_cache_key."
+          }
+        }
       },
       "optimizer": {
         "title": "Bedrock Request Optimizer",

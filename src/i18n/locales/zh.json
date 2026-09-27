@@ -412,7 +412,24 @@
         "mediaFallback": "不支持图片降级",
         "mediaFallbackDescription": "当供应商不支持图片输入时（已声明纯文本能力，或上游返回不支持图片的错误），自动将图片块替换为 [Unsupported Image] 标记，使对话不中断",
         "mediaHeuristic": "纯文本模型预判",
-        "mediaHeuristicDescription": "发送前根据内置的已确认纯文本模型注册表剥离图片。关闭仅停用代理的注册表预判；已声明纯文本模型的处理和上游报错兜底仍保留，且不会改变 Codex 模型目录的能力声明"
+        "mediaHeuristicDescription": "发送前根据内置的已确认纯文本模型注册表剥离图片。关闭仅停用代理的注册表预判；已声明纯文本模型的处理和上游报错兜底仍保留，且不会改变 Codex 模型目录的能力声明",
+        "codexNormalize": {
+          "title": "Codex 整流",
+          "description": "官方 ChatGPT 卡原生 /responses 路由的请求归一化模式（独立于整流器总开关）",
+          "mode": "归一化模式",
+          "modeNames": {
+            "none": "纯透传（调试）",
+            "signature": "最小签名",
+            "full": "完整归一化（默认）",
+            "fullClientMeta": "完整 + 会话标识"
+          },
+          "modes": {
+            "none": "不做任何归一化，裸客户端字段可能触发上游 400，仅用于调试对照",
+            "signature": "仅注入 store:false 与 tool_choice=auto 的最小签名，即可恢复缓存命中",
+            "full": "白名单过滤 + 必填字段兜底 + include/store/stream/tool_choice 注入",
+            "fullClientMeta": "在完整归一化基础上，额外从 prompt_cache_key 派生注入 client_metadata 会话标识"
+          }
+        }
       },
       "optimizer": {
         "title": "Bedrock 请求优化器",

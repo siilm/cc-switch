@@ -412,7 +412,24 @@
         "mediaFallback": "非対応画像フォールバック",
         "mediaFallbackDescription": "プロバイダーが画像入力に対応していない場合（テキストのみの能力が宣言されている、または上流が画像非対応エラーを返した場合）、画像ブロックを [Unsupported Image] マーカーに自動置換し、会話を中断させません",
         "mediaHeuristic": "テキスト専用モデルの事前判定",
-        "mediaHeuristicDescription": "送信前に、内蔵の確認済みテキスト専用モデル登録に基づいて画像を除去します。オフにしても無効になるのはプロキシの登録ベース事前処理だけで、宣言済みテキスト専用モデルの処理と上流エラー時のフォールバックは残り、Codex モデルカタログの能力宣言は変わりません"
+        "mediaHeuristicDescription": "送信前に、内蔵の確認済みテキスト専用モデル登録に基づいて画像を除去します。オフにしても無効になるのはプロキシの登録ベース事前処理だけで、宣言済みテキスト専用モデルの処理と上流エラー時のフォールバックは残り、Codex モデルカタログの能力宣言は変わりません",
+        "codexNormalize": {
+          "title": "Codex 正規化",
+          "description": "公式 ChatGPT カードのネイティブ /responses ルートに対するリクエスト正規化モード（整流器のマスタースイッチとは独立）",
+          "mode": "正規化モード",
+          "modeNames": {
+            "none": "パススルー（デバッグ）",
+            "signature": "最小シグネチャ",
+            "full": "完全正規化（デフォルト）",
+            "fullClientMeta": "完全 + セッション識別"
+          },
+          "modes": {
+            "none": "正規化を一切行いません。裸のクライアントフィールドが上流の 400 を引き起こす可能性があります（デバッグ用）",
+            "signature": "store:false と tool_choice=auto のみを注入する最小シグネチャ。キャッシュヒットを回復します",
+            "full": "ホワイトリストフィルタ + 必須フィールドのデフォルト補完 + include/store/stream/tool_choice の処理",
+            "fullClientMeta": "完全正規化に加え、prompt_cache_key から派生した client_metadata セッション識別を注入"
+          }
+        }
       },
       "optimizer": {
         "title": "Bedrock リクエストオプティマイザー",

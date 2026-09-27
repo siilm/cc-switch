@@ -218,6 +218,32 @@ pub struct RectifierConfig {
     /// 仍保留「显式声明」与「上游兜底」，且不改变 Codex 模型目录声明。
     #[serde(default = "default_true")]
     pub request_media_heuristic: bool,
+    /// Codex 整流：官方卡 native /responses 归一化模式（默认 full）
+    ///
+    /// 独立于总开关 enabled（总开关的历史语义仅覆盖 Anthropic 系整流）。
+    #[serde(default = "default_codex_normalize_mode")]
+    pub codex_normalize_mode: CodexNormalizeMode,
+}
+
+/// Codex 官方卡 native /responses 归一化模式
+///
+/// 缺 codex-rs 签名字段的裸请求会被 ChatGPT 后端分到降级 prompt 缓存路径
+/// （实测裸请求 ~35–60% 命中，补齐签名后 ~96%）。门控看字段存在性，与值无关。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CodexNormalizeMode {
+    /// 纯透传：不做任何归一化（调试对照组；裸客户端字段可能触发上游 400）
+    None,
+    /// 最小签名：白名单过滤 + store:false + tool_choice:"auto"
+    Signature,
+    /// 完整归一化（当前默认行为）
+    Full,
+    /// Full + 注入 client_metadata 会话标识（从 prompt_cache_key 派生）
+    FullClientMeta,
+}
+
+fn default_codex_normalize_mode() -> CodexNormalizeMode {
+    CodexNormalizeMode::Full
 }
 
 fn default_true() -> bool {
@@ -236,6 +262,7 @@ impl Default for RectifierConfig {
             request_thinking_budget: true,
             request_media_fallback: true,
             request_media_heuristic: true,
+            codex_normalize_mode: CodexNormalizeMode::Full,
         }
     }
 }
